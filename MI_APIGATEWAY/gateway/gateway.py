@@ -1,58 +1,44 @@
 import os
-import secrets
 import httpx
 from fastapi import FastAPI, Depends, HTTPException, Request, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-app = FastAPI(
-    title="Secure TechStore API Gateway",
-    description="API Gateway con HashiCorp Vault y Bearer Token"
-)
+app = FastAPI(title="Secure TechStore API Gateway con Auth Service")
 
 security = HTTPBearer(auto_error=False)
 
-VAULT_ADDR = os.getenv("VAULT_ADDR", "http://127.0.0.1:8200")
-VAULT_TOKEN = os.getenv("VAULT_TOKEN")
+AUTH_SERVICE_URL = os.getenv("AUTH_SERVICE_URL", "http://localhost:7000")
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:9000")
+BACKEND_SECRET = os.getenv("INTERNAL_GATEWAY_SECRET", "techstore-api-secret-456")
 
-if not VAULT_TOKEN:
-    raise RuntimeError("VAULT_TOKEN no esta configurado")
-
-async def get_gateway_secrets():
-    url = f"{VAULT_ADDR}/v1/secret/data/gateway"
-    headers = {"X-Vault-Token": VAULT_TOKEN}
-    
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        response = await client.get(url, headers=headers)
-        if response.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"No fue posible acceder a Vault ({response.status_code})")
-        
-        vault_response = response.json()
-        return vault_response["data"]["data"]
-
-async def authenticate_client(credentials: HTTPAuthorizationCredentials = Depends(security)):
+async def authenticate_via_auth_service(credentials: HTTPAuthorizationCredentials = Depends(security)):
     if credentials is None:
         raise HTTPException(status_code=401, detail="Bearer token requerido")
     
-    vault_secrets = await get_gateway_secrets()
-    expected_token = vault_secrets["client_token"]
-    received_token = credentials.credentials
+    token = credentials.credentials
+    headers = {"Authorization": f"Bearer {token}"}
     
-    valid = secrets.compare_digest(received_token, expected_token)
-    if not valid:
-        raise HTTPException(status_code=401, detail="Token invalido")
-    
-    return {
-        "client_id": "techstore-student-client",
-        "backend_secret": vault_secrets["backend_shared_secret"]
-    }
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        try:
+            res = await client.get(f"{AUTH_SERVICE_URL}/validate", headers=headers)
+        except httpx.RequestError:
+            raise HTTPException(status_code=503, detail="Servicio de Autenticacion no disponible")
+            
+        if res.status_code != 200:
+            raise HTTPException(status_code=401, detail="Token rechazado por Auth Service")
+        
+        auth_data = res.json()
+        return {
+            "client_id": auth_data.get("client_id", "techstore-client"),
+            "backend_secret": BACKEND_SECRET
+        }
 
 @app.get("/health")
 def health():
     return {"status": "OK", "service": "API Gateway"}
 
 @app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
-async def proxy(path: str, request: Request, auth: dict = Depends(authenticate_client)):
+async def proxy(path: str, request: Request, auth: dict = Depends(authenticate_via_auth_service)):
     target_url = f"{BACKEND_URL}/{path}"
     body = await request.body()
     
